@@ -77,6 +77,12 @@ Overlay terminal_page {
       button: 0;
     }
 
+    GestureLongPress {
+      pressed => $touch_long_press();
+      cancelled => $touch_long_press_cancelled();
+      touch-only: true;
+    }
+
     GestureDrag {
       drag-begin => $touch_drag_begin();
       drag-update => $touch_drag_update();

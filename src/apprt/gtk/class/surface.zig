@@ -40,9 +40,16 @@ const media = @import("../media.zig");
 const log = std.log.scoped(.gtk_ghostty_surface);
 
 /// Minimum touch drag distance, in GTK widget coordinates, before a touch
-/// interaction is treated as scroll instead of tap. This mirrors the small
-/// dead zone users expect from touch UIs and prevents accidental selection.
-const touch_drag_threshold = 2.0;
+/// interaction leaves the tap dead-zone. This mirrors the small dead-zone users
+/// expect from touch UIs and prevents jitter from becoming selection/scroll.
+const touch_drag_threshold = 10.0;
+
+/// Coarse touchscreen interaction state. Touch starts as a deferred tap; once
+/// movement or long-press disambiguates intent we commit to exactly one mode.
+const TouchMode = enum { none, tap, scroll, select };
+
+/// Dominant-axis lock for committed touch scrolling.
+const TouchScrollAxis = enum { none, horizontal, vertical };
 
 pub const Surface = extern struct {
     const Self = @This();
@@ -739,24 +746,23 @@ pub const Surface = extern struct {
         /// stops scrolling.
         pending_horizontal_scroll_reset: ?c_uint = null,
 
-        /// Last vertical offset from a touchscreen drag gesture. GTK reports
-        /// drag updates as total offset from drag begin, while Ghostty wants
+        /// Current touchscreen interaction state.
+        touch_mode: TouchMode = .none,
+
+        /// Dominant axis for committed touch scrolling.
+        touch_scroll_axis: TouchScrollAxis = .none,
+
+        /// Last offsets from a touchscreen drag gesture. GTK reports drag
+        /// updates as total offset from drag begin, while Ghostty wants
         /// per-event scroll deltas.
+        touch_drag_last_offset_x: f64 = 0.0,
         touch_drag_last_offset_y: f64 = 0.0,
 
         /// Start position for the active touch drag, in GTK widget coordinates.
         /// We combine this with drag offsets to keep terminal mouse position
-        /// current for mouse-reporting TUIs.
+        /// current for mouse-reporting TUIs and local selection.
         touch_drag_start_x: f64 = 0.0,
         touch_drag_start_y: f64 = 0.0,
-
-        /// True between touch press/release. We defer forwarding touchscreen
-        /// left-clicks until release so a touch drag can become scroll-only and
-        /// won't briefly start a terminal selection.
-        touch_tap_pending: bool = false,
-
-        /// True if the current touch interaction has moved enough to be a drag.
-        touch_drag_moved: bool = false,
 
         overrides: struct {
             command: ?configpkg.Command = null,
@@ -2903,7 +2909,7 @@ pub const Surface = extern struct {
         const gtk_mods = event.getModifierState();
         const button = translateMouseButton(gesture.as(gtk.GestureSingle).getCurrentButton());
 
-        if (isTouchEvent(gesture) and button == .left and priv.touch_tap_pending) {
+        if (isTouchEvent(gesture) and button == .left and priv.touch_mode == .tap) {
             const sequence = gesture.as(gtk.GestureSingle).getCurrentSequence();
             var touch_x = x;
             var touch_y = y;
@@ -2979,8 +2985,9 @@ pub const Surface = extern struct {
 
     fn touchTapBegin(self: *Self, x: f64, y: f64) void {
         const priv = self.private();
-        priv.touch_tap_pending = true;
-        priv.touch_drag_moved = false;
+        priv.touch_mode = .tap;
+        priv.touch_scroll_axis = .none;
+        priv.touch_drag_last_offset_x = 0.0;
         priv.touch_drag_last_offset_y = 0.0;
         self.updateCursorPosFromWidgetCoordinates(x, y);
     }
@@ -2995,12 +3002,10 @@ pub const Surface = extern struct {
         const priv = self.private();
         const surface = priv.core_surface orelse return;
 
-        priv.touch_tap_pending = false;
-        defer priv.touch_drag_moved = false;
-
-        // A touchscreen drag is scroll-only. Do not send the deferred click,
+        // A committed drag is not a tap. Do not send the deferred click,
         // otherwise the initial press can start a terminal selection.
-        if (priv.touch_drag_moved) return;
+        if (priv.touch_mode != .tap) return;
+        defer priv.touch_mode = .none;
 
         self.updateCursorPosFromWidgetCoordinates(x, y);
         const mods = gtk_key.translateMods(gtk_mods);
@@ -3024,6 +3029,59 @@ pub const Surface = extern struct {
         }
     }
 
+    fn touchLongPress(
+        gesture: *gtk.GestureLongPress,
+        x: f64,
+        y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        if (priv.touch_mode != .tap) return;
+
+        priv.touch_mode = .select;
+        priv.touch_scroll_axis = .none;
+
+        self.updateAndNotifyTouchCursorPos(
+            x,
+            y,
+            gesture.as(gtk.EventController).getCurrentEvent(),
+        );
+
+        const event = gesture.as(gtk.EventController).getCurrentEvent();
+        const mods = if (event) |ev|
+            gtk_key.translateMods(ev.getModifierState())
+        else
+            input.Mods{};
+        _ = surface.mouseButtonCallback(.press, .left, mods) catch |err| {
+            log.warn("error in touch selection press callback err={}", .{err});
+            priv.touch_mode = .none;
+            return;
+        };
+    }
+
+    fn touchLongPressCancelled(
+        gesture: *gtk.GestureLongPress,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        if (priv.touch_mode != .select) return;
+
+        const surface = priv.core_surface orelse {
+            priv.touch_mode = .none;
+            return;
+        };
+        const mods = if (gesture.as(gtk.EventController).getCurrentEvent()) |event|
+            gtk_key.translateMods(event.getModifierState())
+        else
+            input.Mods{};
+
+        _ = surface.mouseButtonCallback(.release, .left, mods) catch |err| {
+            log.warn("error in touch selection cancel release callback err={}", .{err});
+        };
+        priv.touch_mode = .none;
+    }
+
     fn touchDragBegin(
         gesture: *gtk.GestureDrag,
         x: f64,
@@ -3031,7 +3089,9 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+        priv.touch_drag_last_offset_x = 0.0;
         priv.touch_drag_last_offset_y = 0.0;
+        priv.touch_scroll_axis = .none;
         priv.touch_drag_start_x = x;
         priv.touch_drag_start_y = y;
         self.updateAndNotifyTouchCursorPos(
@@ -3053,20 +3113,51 @@ pub const Surface = extern struct {
         const priv = self.private();
         const surface = priv.core_surface orelse return;
 
-        const delta_y = offset_y - priv.touch_drag_last_offset_y;
-        priv.touch_drag_last_offset_y = offset_y;
-        if (delta_y == 0.0) return;
-        if (@abs(offset_y) > touch_drag_threshold) priv.touch_drag_moved = true;
-
+        const event = gesture.as(gtk.EventController).getCurrentEvent();
         self.updateAndNotifyTouchCursorPos(
             priv.touch_drag_start_x + offset_x,
             priv.touch_drag_start_y + offset_y,
-            gesture.as(gtk.EventController).getCurrentEvent(),
+            event,
         );
 
-        const scaled = self.scaledCoordinates(0, delta_y);
+        switch (priv.touch_mode) {
+            .none => return,
+            .tap => {
+                const distance = @sqrt(offset_x * offset_x + offset_y * offset_y);
+                // Ignore small touch jitter. Without this, normal taps frequently
+                // look like very small drags and never produce a click.
+                if (distance <= touch_drag_threshold) return;
+
+                // Quick motion past the dead-zone commits to scrolling. Lock to
+                // the dominant axis and drop the threshold-crossing delta so the
+                // first scroll event doesn't jump by the jitter distance.
+                priv.touch_mode = .scroll;
+                priv.touch_scroll_axis = if (@abs(offset_x) > @abs(offset_y))
+                    .horizontal
+                else
+                    .vertical;
+                priv.touch_drag_last_offset_x = offset_x;
+                priv.touch_drag_last_offset_y = offset_y;
+                return;
+            },
+            .select => return,
+            .scroll => {},
+        }
+
+        const delta_x = offset_x - priv.touch_drag_last_offset_x;
+        const delta_y = offset_y - priv.touch_drag_last_offset_y;
+        priv.touch_drag_last_offset_x = offset_x;
+        priv.touch_drag_last_offset_y = offset_y;
+
+        const scaled = switch (priv.touch_scroll_axis) {
+            .none => return,
+            .horizontal => self.scaledCoordinates(delta_x, 0),
+            .vertical => self.scaledCoordinates(0, delta_y),
+        };
+        if (scaled.x == 0.0 and scaled.y == 0.0) return;
+
         surface.scrollCallback(
-            0,
+            scaled.x,
             scaled.y,
             .{ .precision = true },
         ) catch |err| {
@@ -3075,12 +3166,52 @@ pub const Surface = extern struct {
     }
 
     fn touchDragEnd(
-        _: *gtk.GestureDrag,
-        _: f64,
-        _: f64,
+        gesture: *gtk.GestureDrag,
+        offset_x: f64,
+        offset_y: f64,
         self: *Self,
     ) callconv(.c) void {
-        self.private().touch_drag_last_offset_y = 0.0;
+        const priv = self.private();
+        priv.touch_drag_last_offset_x = 0.0;
+        priv.touch_drag_last_offset_y = 0.0;
+        priv.touch_scroll_axis = .none;
+
+        const event = gesture.as(gtk.EventController).getCurrentEvent();
+        switch (priv.touch_mode) {
+            .tap => {
+                // GTK may emit drag-begin/update/end for touch jitter without a
+                // matching GestureClick release. If the interaction stayed within
+                // our threshold, finish it as a tap so touch click still works.
+                if (event) |ev| {
+                    self.touchTapEnd(
+                        ev,
+                        priv.touch_drag_start_x + offset_x,
+                        priv.touch_drag_start_y + offset_y,
+                        ev.getModifierState(),
+                    );
+                } else {
+                    priv.touch_mode = .none;
+                }
+            },
+            .select => {
+                self.updateAndNotifyTouchCursorPos(
+                    priv.touch_drag_start_x + offset_x,
+                    priv.touch_drag_start_y + offset_y,
+                    event,
+                );
+                const surface = priv.core_surface orelse return;
+                const mods = if (event) |ev|
+                    gtk_key.translateMods(ev.getModifierState())
+                else
+                    input.Mods{};
+                _ = surface.mouseButtonCallback(.release, .left, mods) catch |err| {
+                    log.warn("error in touch selection release callback err={}", .{err});
+                    return;
+                };
+                priv.touch_mode = .none;
+            },
+            .scroll, .none => priv.touch_mode = .none,
+        }
     }
 
     fn ecMouseMotion(
@@ -3827,6 +3958,8 @@ pub const Surface = extern struct {
             class.bindTemplateCallback("key_released", &ecKeyReleased);
             class.bindTemplateCallback("mouse_down", &gcMouseDown);
             class.bindTemplateCallback("mouse_up", &gcMouseUp);
+            class.bindTemplateCallback("touch_long_press", &touchLongPress);
+            class.bindTemplateCallback("touch_long_press_cancelled", &touchLongPressCancelled);
             class.bindTemplateCallback("touch_drag_begin", &touchDragBegin);
             class.bindTemplateCallback("touch_drag_update", &touchDragUpdate);
             class.bindTemplateCallback("touch_drag_end", &touchDragEnd);
